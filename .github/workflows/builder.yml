@@ -4,43 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       project_type:
-        description: 'Jenis Project'
-        required: true
+        description: 'auto / flutter / native / web2apk'
+        required: false
         default: 'auto'
-        type: choice
-        options: [auto, native, web2apk, flutter]
       app_name:
-        description: 'Nama Aplikasi (opsional)'
         required: false
         default: ''
       package_name:
-        description: 'Package Name (opsional)'
         required: false
         default: ''
       version_name:
-        description: 'Version Name (opsional)'
         required: false
         default: ''
       version_code:
-        description: 'Version Code (opsional)'
         required: false
         default: ''
       build_type:
-        description: 'Build Type'
-        required: true
+        required: false
         default: 'release'
-        type: choice
-        options: [release, debug]
       website_url:
-        description: 'Website URL (khusus Web2APK)'
         required: false
         default: ''
       chat_id:
-        description: 'Telegram Chat ID (opsional)'
         required: false
         default: ''
       bot_token:
-        description: 'Telegram Bot Token (opsional)'
         required: false
         default: ''
   push:
@@ -48,260 +36,393 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: write
 
     steps:
-      # ===================== CHECKOUT =====================
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ===================== RESOLVE CONFIG =====================
-      - name: Resolve Configuration
-        shell: bash
+      # ═══════════════ ENV SETUP ═══════════════
+      - name: Android SDK Env
         run: |
-          set +e
-          PTYPE="${{ github.event.inputs.project_type }}"
-          APP_NAME="${{ github.event.inputs.app_name }}"
-          PKG="${{ github.event.inputs.package_name }}"
-          VNAME="${{ github.event.inputs.version_name }}"
-          VCODE="${{ github.event.inputs.version_code }}"
-          BTYPE="${{ github.event.inputs.build_type }}"
-          WEB_URL="${{ github.event.inputs.website_url }}"
-          CHAT_ID="${{ github.event.inputs.chat_id }}"
-          BOT_TOKEN="${{ github.event.inputs.bot_token }}"
-
-          if [ -f build-config.json ]; then
-            echo "::group::build-config.json"
-            cat build-config.json
-            echo "::endgroup::"
-            if [ -z "$PTYPE" ] || [ "$PTYPE" = "auto" ]; then
-              T=$(jq -r '.type // empty' build-config.json); [ -n "$T" ] && PTYPE="$T"
-            fi
-            [ -z "$APP_NAME" ] && APP_NAME=$(jq -r '.app_name // empty' build-config.json)
-            [ -z "$PKG" ]      && PKG=$(jq -r '.package_name // empty' build-config.json)
-            [ -z "$VNAME" ]    && VNAME=$(jq -r '.version_name // empty' build-config.json)
-            [ -z "$VCODE" ]    && VCODE=$(jq -r '.version_code // empty' build-config.json)
-            [ -z "$BTYPE" ]    && BTYPE=$(jq -r '.build_type // empty' build-config.json)
-            [ -z "$WEB_URL" ]  && WEB_URL=$(jq -r '.url // empty' build-config.json)
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1 > /tmp/sdkmgr
+          SDKMGR=$(cat /tmp/sdkmgr 2>/dev/null || true)
+          if [ -n "$SDKMGR" ]; then
+            yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
           fi
+          echo "SDKMGR=$SDKMGR" >> $GITHUB_ENV
 
-          # Defaults
-          [ -z "$APP_NAME" ] && APP_NAME="SyncXxX"
-          [ -z "$PKG" ]      && PKG="com.example.app"
-          [ -z "$VNAME" ]    && VNAME="1.0.0"
-          [ -z "$VCODE" ]    && VCODE="1"
-          [ -z "$BTYPE" ]    && BTYPE="release"
-
-          # Auto-detect
-          if [ -z "$PTYPE" ] || [ "$PTYPE" = "auto" ] || [ "$PTYPE" = "null" ]; then
-            if [ -f pubspec.yaml ] || [ -f flutter-project.zip ]; then
-              PTYPE="flutter"
-            elif [ -f android/gradlew ] || [ -d android/app ]; then
-              PTYPE="native"
-            elif [ -f web2apk-config.json ] || [ -d web2apk ]; then
-              PTYPE="web2apk"
-            else
-              PTYPE="native"
-            fi
-          fi
-
-          # Simpan ke env
-          {
-            echo "PTYPE=$PTYPE"
-            echo "APP_NAME=$APP_NAME"
-            echo "PKG=$PKG"
-            echo "VNAME=$VNAME"
-            echo "VCODE=$VCODE"
-            echo "BTYPE=$BTYPE"
-            echo "WEB_URL=$WEB_URL"
-            echo "CHAT_ID=$CHAT_ID"
-            echo "BOT_TOKEN=$BOT_TOKEN"
-          } >> $GITHUB_ENV
-
-          echo "═══════════ Build Config ═══════════"
-          echo "Jenis Project : $PTYPE"
-          echo "App Name      : $APP_NAME"
-          echo "Package       : $PKG"
-          echo "Version       : $VNAME ($VCODE)"
-          echo "Build Type    : $BTYPE"
-          echo "Website URL   : $WEB_URL"
-          echo "════════════════════════════════════"
-
-      # ===================== NOTIFY START =====================
-      - name: Notify Start
-        if: env.CHAT_ID != '' && env.BOT_TOKEN != ''
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" -d parse_mode="HTML" \
-            -d text="⏳ <b>Build dimulai!</b>%0A%0A🏷️ App: <code>${APP_NAME}</code>%0A📦 Package: <code>${PKG}</code>%0A🔢 Versi: <code>${VNAME}</code>+<code>${VCODE}</code>%0A🔨 Tipe: <code>${BTYPE}</code>%0A📂 Jenis: <code>${PTYPE}</code>"
-
-      # ===================== SETUP =====================
-      - name: Set up JDK 17
+      - name: JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Python
-        if: env.PTYPE == 'native'
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Tools
-        run: sudo apt-get update && sudo apt-get install -y imagemagick jq unzip curl zip
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick jq unzip curl zip >/dev/null
 
-      - name: Generate Keystore
+      - name: Keystore
         run: |
           keytool -genkey -v -keystore release.keystore -alias release \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass password -keypass password \
-            -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID"
+            -dname "CN=Builder, O=Builder, C=ID" 2>/dev/null
 
-      # ══════════════════════════════════════════════════════
-      #                     NATIVE ANDROID
-      # ══════════════════════════════════════════════════════
-      - name: NATIVE — Install Pillow
-        if: env.PTYPE == 'native'
-        run: pip install Pillow
-
-      - name: NATIVE — Generate Icons
-        if: env.PTYPE == 'native'
-        run: python3 generate_icons.py || echo "generate_icons.py tidak ada, skip"
-
-      - name: NATIVE — Patch AndroidManifest.xml
-        if: env.PTYPE == 'native'
+      # ═══════════════ RESOLVE CONFIG ═══════════════
+      - name: Resolve Config
+        id: cfg
+        shell: bash
         run: |
-          M="android/app/src/main/AndroidManifest.xml"
+          set +e
+          PT="${{ github.event.inputs.project_type }}"; [ -z "$PT" ] && PT="auto"
+          APP="${{ github.event.inputs.app_name }}"
+          PKG="${{ github.event.inputs.package_name }}"
+          VN="${{ github.event.inputs.version_name }}"
+          VC="${{ github.event.inputs.version_code }}"
+          BT="${{ github.event.inputs.build_type }}"; [ -z "$BT" ] && BT="release"
+          URL="${{ github.event.inputs.website_url }}"
+          CHAT="${{ github.event.inputs.chat_id }}"
+          TOKEN="${{ github.event.inputs.bot_token }}"
+
+          for f in build-config.json config.json builder.json app.json; do
+            if [ -f "$f" ]; then
+              echo "::group::$f"; cat "$f"; echo "::endgroup::"
+              [ -z "$APP" ] && APP=$(jq -r '.app_name // .name // empty' "$f" 2>/dev/null)
+              [ -z "$PKG" ] && PKG=$(jq -r '.package_name // .package // .applicationId // empty' "$f" 2>/dev/null)
+              [ -z "$VN" ]  && VN=$(jq -r '.version_name // .version // empty' "$f" 2>/dev/null)
+              [ -z "$VC" ]  && VC=$(jq -r '.version_code // empty' "$f" 2>/dev/null)
+              [ -z "$URL" ] && URL=$(jq -r '.url // .website // .web_url // empty' "$f" 2>/dev/null)
+              [ -z "$BT" ]  && BT=$(jq -r '.build_type // empty' "$f" 2>/dev/null)
+              if [ "$PT" = "auto" ]; then
+                T=$(jq -r '.type // empty' "$f" 2>/dev/null); [ -n "$T" ] && PT="$T"
+              fi
+            fi
+          done
+
+          [ -z "$APP" ] && APP="SyncXxX"
+          [ -z "$PKG" ] && PKG="com.builder.app"
+          [ -z "$VN" ]  && VN="1.0.0"
+          [ -z "$VC" ]  && VC="1"
+          [ -z "$BT" ]  && BT="release"
+
+          # Auto-detect project type
+          if [ "$PT" = "auto" ] || [ -z "$PT" ]; then
+            if [ -f pubspec.yaml ] || [ -f flutter-project.zip ] || ls *.zip 2>/dev/null | grep -qi flutter; then
+              PT="flutter"
+            elif [ -f package.json ] && (grep -q '"react-native"' package.json 2>/dev/null || grep -q '"@capacitor/core"' package.json 2>/dev/null); then
+              PT="native"
+            elif [ -f android/gradlew ] || [ -d android/app ] || [ -f build.gradle ] || [ -f settings.gradle ]; then
+              PT="native"
+            elif [ -n "$URL" ]; then
+              PT="web2apk"
+            else
+              # Cek isi zip
+              ZIP=$(ls *.zip 2>/dev/null | head -1)
+              if [ -n "$ZIP" ]; then
+                if unzip -l "$ZIP" 2>/dev/null | grep -q 'pubspec.yaml'; then PT="flutter"
+                elif unzip -l "$ZIP" 2>/dev/null | grep -q 'android/gradlew'; then PT="native"
+                else PT="web2apk"; fi
+              else
+                PT="web2apk"
+              fi
+            fi
+          fi
+
+          {
+            echo "PT=$PT"; echo "APP=$APP"; echo "PKG=$PKG"
+            echo "VN=$VN"; echo "VC=$VC"; echo "BT=$BT"
+            echo "URL=$URL"; echo "CHAT=$CHAT"; echo "TOKEN=$TOKEN"
+          } >> $GITHUB_ENV
+
+          echo "═══════ CONFIG ═══════"
+          echo "Type    : $PT"
+          echo "App     : $APP"
+          echo "Package : $PKG"
+          echo "Version : $VN ($VC)"
+          echo "Build   : $BT"
+          echo "URL     : $URL"
+          echo "══════════════════════"
+
+      - name: Notify Start
+        if: env.CHAT != '' && env.TOKEN != ''
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d chat_id="${CHAT}" -d parse_mode="HTML" \
+            -d text="⏳ <b>Build Start</b>%0A🏷️ ${APP}%0A📦 <code>${PKG}</code>%0A🔨 ${BT} • ${PT}"
+
+      # ═══════════════ UNZIP (kalau ada ZIP) ═══════════════
+      - name: Auto Unzip
+        shell: bash
+        run: |
+          set +e
+          ZIP=$(ls *.zip 2>/dev/null | head -1)
+          if [ -n "$ZIP" ] && [ ! -d "src" ]; then
+            echo "📦 Found ZIP: $ZIP"
+            mkdir -p src
+            unzip -q "$ZIP" -d src 2>/dev/null
+            # Ratakan kalau cuma 1 folder
+            CNT=$(find src -mindepth 1 -maxdepth 1 | wc -l)
+            FIRST=$(find src -mindepth 1 -maxdepth 1 -type d | head -1)
+            if [ "$CNT" = "1" ] && [ -n "$FIRST" ] && [ -z "$(find src -mindepth 1 -maxdepth 1 -type f)" ]; then
+              TMP=$(mktemp -d); cp -R "$FIRST"/. "$TMP"/; rm -rf src; mkdir -p src; cp -R "$TMP"/. src/
+            fi
+            # Pindah ke root
+            if [ -f src/pubspec.yaml ] || [ -f src/android/gradlew ] || [ -d src/android ]; then
+              cp -R src/. . 2>/dev/null || true
+            fi
+          fi
+          echo "── Root listing ──"
+          ls -la
+
+      # ═══════════════ FLUTTER ═══════════════
+      - name: Flutter — Setup Project
+        if: env.PT == 'flutter'
+        shell: bash
+        run: |
+          set +e
+          if [ -f pubspec.yaml ]; then
+            mkdir -p flutter-project
+            cp -R . flutter-project/ 2>/dev/null || true
+            rm -rf flutter-project/flutter-project flutter-project/src
+          elif [ -f flutter-project.zip ]; then
+            mkdir -p flutter-project
+            unzip -q flutter-project.zip -d flutter-project
+            FIRST=$(find flutter-project -mindepth 1 -maxdepth 1 -type d | head -1)
+            CNT=$(find flutter-project -mindepth 1 -maxdepth 1 | wc -l)
+            if [ "$CNT" = "1" ] && [ -f "$FIRST/pubspec.yaml" ]; then
+              TMP=$(mktemp -d); cp -R "$FIRST"/. "$TMP"/; rm -rf flutter-project
+              mkdir -p flutter-project; cp -R "$TMP"/. flutter-project/
+            fi
+          fi
+          [ -f flutter-project/pubspec.yaml ] && echo "✓ pubspec.yaml OK" || { echo "❌ pubspec.yaml not found"; exit 1; }
+
+      - name: Flutter — Detect Version
+        if: env.PT == 'flutter'
+        shell: bash
+        run: |
+          set +e
+          PUB="flutter-project/pubspec.yaml"
+          SDK=$(grep -A3 '^environment:' "$PUB" | grep 'sdk:' | head -1 | sed 's/.*sdk:[[:space:]]*//; s/["'"'"']//g')
+          DART=$(echo "$SDK" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+          FV="3.27.0"
+          case "$DART" in
+            3.1[0-9]*) FV="3.35.2" ;;
+            3.[89]*)   FV="3.35.2" ;;
+            3.7*)      FV="3.29.0" ;;
+            3.6*)      FV="3.27.0" ;;
+            3.5*)      FV="3.24.0" ;;
+            3.4*)      FV="3.22.0" ;;
+            3.3*)      FV="3.19.0" ;;
+            3.2*)      FV="3.16.0" ;;
+            3.1*)      FV="3.13.0" ;;
+            3.0*)      FV="3.10.0" ;;
+          esac
+          grep -qE 'webview_flutter:[[:space:]]*(\^|>=)?[45]\.' "$PUB" && FV="3.35.2"
+          grep -qE 'geolocator:[[:space:]]*(\^|>=)?1[4-9]\.' "$PUB" && FV="3.35.2"
+          grep -qE 'firebase_core:[[:space:]]*(\^|>=)?3\.' "$PUB" && FV="3.35.2"
+          echo "FLUTTER_VERSION=$FV" >> $GITHUB_ENV
+          echo "Using Flutter $FV"
+
+      - name: Flutter — Setup SDK
+        if: env.PT == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter — Build
+        if: env.PT == 'flutter'
+        shell: bash
+        run: |
+          set +e
+          cd flutter-project
+          flutter config --no-analytics >/dev/null 2>&1
+          MAX=4; N=0; OK=0
+          while [ $N -lt $MAX ] && [ $OK -eq 0 ]; do
+            N=$((N+1))
+            echo "── Attempt $N/$MAX ──"
+            flutter pub get 2>&1 | tee ../pub.log
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+              if [ "$BT" = "release" ]; then flutter build apk --release 2>&1 | tee -a ../pub.log
+              else flutter build apk --debug 2>&1 | tee -a ../pub.log; fi
+              [ ${PIPESTATUS[0]} -eq 0 ] && OK=1 && break
+            fi
+            # Auto-fix
+            sed -i -E "s/sdk:[[:space:]]*['\"]?[\^>=]*3\.[0-9]+(\.[0-9]+)?['\"]?/sdk: \">=3.6.0 <4.0.0\"/g" pubspec.yaml 2>/dev/null
+            grep -q "webview_flutter" ../pub.log 2>/dev/null && sed -i -E "s/webview_flutter:[[:space:]]*['\"]?[^'\"]+['\"]?/webview_flutter: ^4.13.0/g" pubspec.yaml
+            grep -q "geolocator" ../pub.log 2>/dev/null && sed -i -E "s/geolocator:[[:space:]]*['\"]?[^'\"]+['\"]?/geolocator: ^13.0.4/g" pubspec.yaml
+            grep -q "firebase_core" ../pub.log 2>/dev/null && sed -i -E "s/firebase_core:[[:space:]]*['\"]?[^'\"]+['\"]?/firebase_core: ^2.32.0/g" pubspec.yaml
+            grep -q "permission_handler" ../pub.log 2>/dev/null && sed -i -E "s/permission_handler:[[:space:]]*['\"]?[^'\"]+['\"]?/permission_handler: ^11.3.1/g" pubspec.yaml
+            grep -q "image_picker" ../pub.log 2>/dev/null && sed -i -E "s/image_picker:[[:space:]]*['\"]?[^'\"]+['\"]?/image_picker: ^1.1.2/g" pubspec.yaml
+            rm -f pubspec.lock; rm -rf build .dart_tool
+          done
+          [ $OK -eq 1 ] && echo "✅ Flutter build OK" || { echo "❌ Flutter gagal"; tail -100 ../pub.log; exit 1; }
+
+      # ═══════════════ NATIVE ═══════════════
+      - name: Native — Locate Project
+        if: env.PT == 'native'
+        shell: bash
+        run: |
+          set +e
+          # Cari folder yang punya gradlew atau build.gradle
+          NATIVE_ROOT="."
+          if [ ! -f android/gradlew ] && [ ! -f android/build.gradle ] && [ ! -f android/build.gradle.kts ]; then
+            FOUND=$(find . -maxdepth 3 -name "gradlew" -type f 2>/dev/null | grep -v "gradle/wrapper" | head -1)
+            if [ -n "$FOUND" ]; then
+              NATIVE_ROOT=$(dirname "$FOUND")
+              echo "Found native root: $NATIVE_ROOT"
+            fi
+          fi
+          # Kalau gradlew ada di folder yang sama dengan android/
+          if [ -d "$NATIVE_ROOT/android" ] && [ ! -f "$NATIVE_ROOT/gradlew" ]; then
+            [ -f "$NATIVE_ROOT/android/gradlew" ] && NATIVE_ROOT="$NATIVE_ROOT/android"
+          fi
+          echo "NATIVE_ROOT=$NATIVE_ROOT" >> $GITHUB_ENV
+
+      - name: Native — Patch Config
+        if: env.PT == 'native'
+        shell: bash
+        run: |
+          set +e
+          cd "${NATIVE_ROOT:-.}"
+          M="app/src/main/AndroidManifest.xml"
+          [ -f "$M" ] || M="android/app/src/main/AndroidManifest.xml"
           if [ -f "$M" ]; then
             OLD=$(grep -oP '(?<=package=")[^"]+' "$M" | head -1)
             [ -n "$OLD" ] && sed -i "s|$OLD|${PKG}|g" "$M"
-            sed -i "s|android:label=\"[^\"]*\"|android:label=\"${APP_NAME}\"|g" "$M"
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"${APP}\"|g" "$M"
+          fi
+          for G in app/build.gradle app/build.gradle.kts android/app/build.gradle android/app/build.gradle.kts build.gradle build.gradle.kts; do
+            if [ -f "$G" ]; then
+              sed -i "s|applicationId \"[^\"]*\"|applicationId \"${PKG}\"|g" "$G"
+              sed -i "s|applicationId = \"[^\"]*\"|applicationId = \"${PKG}\"|g" "$G"
+              sed -i "s|versionCode [0-9]*|versionCode ${VC}|g" "$G"
+              sed -i "s|versionCode = [0-9]*|versionCode = ${VC}|g" "$G"
+              sed -i "s|versionName \"[^\"]*\"|versionName \"${VN}\"|g" "$G"
+              sed -i "s|versionName = \"[^\"]*\"|versionName = \"${VN}\"|g" "$G"
+            fi
+          done
+          for S in app/src/main/res/values/strings.xml android/app/src/main/res/values/strings.xml; do
+            [ -f "$S" ] && sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${APP}</string>|g" "$S"
+          done
+
+      - name: Native — Icons
+        if: env.PT == 'native'
+        shell: bash
+        run: |
+          set +e
+          [ -f generate_icons.py ] && pip install Pillow -q && python3 generate_icons.py || echo "skip icons"
+
+      - name: Native — Fix Gradle Wrapper
+        if: env.PT == 'native'
+        shell: bash
+        run: |
+          set +e
+          cd "${NATIVE_ROOT:-.}"
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            # Pastikan wrapper jar ada
+            if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+              mkdir -p gradle/wrapper
+              curl -sL -o gradle/wrapper/gradle-wrapper.jar \
+                "https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar"
+            fi
+            # Pastikan distributionUrl wajar
+            if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+              if grep -qE "gradle-[0-9]+\.[0-9]+" gradle/wrapper/gradle-wrapper.properties; then
+                grep -oE "gradle-[0-9]+\.[0-9]+" gradle/wrapper/gradle-wrapper.properties | head -1
+              fi
+            fi
           fi
 
-      - name: NATIVE — Patch build.gradle
-        if: env.PTYPE == 'native'
+      - name: Native — Build
+        if: env.PT == 'native'
+        shell: bash
         run: |
-          G="android/app/build.gradle"
-          [ -f "$G" ] || G="android/app/build.gradle.kts"
-          if [ -f "$G" ]; then
-            sed -i "s|applicationId \"[^\"]*\"|applicationId \"${PKG}\"|" "$G"
-            sed -i "s|versionCode [0-9]*|versionCode ${VCODE}|" "$G"
-            sed -i "s|versionName \"[^\"]*\"|versionName \"${VNAME}\"|" "$G"
-          fi
-
-      - name: NATIVE — Patch strings.xml
-        if: env.PTYPE == 'native'
-        run: |
-          S="android/app/src/main/res/values/strings.xml"
-          [ -f "$S" ] && sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${APP_NAME}</string>|g" "$S"
-
-      - name: NATIVE — Setup Gradle Wrapper
-        if: env.PTYPE == 'native'
-        run: |
-          mkdir -p android/gradle/wrapper
-          [ -f android/gradle/wrapper/gradle-wrapper.jar ] || \
-            curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
-              "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar"
-          chmod +x android/gradlew || true
-
-      - name: NATIVE — Build APK
-        if: env.PTYPE == 'native'
-        run: |
-          cd android
-          if [ "$BTYPE" = "release" ]; then
-            ./gradlew assembleRelease --no-daemon
+          set +e
+          cd "${NATIVE_ROOT:-.}"
+          chmod +x gradlew 2>/dev/null
+          if [ "$BT" = "release" ]; then TASK="assembleRelease"; else TASK="assembleDebug"; fi
+          if [ -x ./gradlew ]; then
+            ./gradlew "$TASK" --no-daemon --stacktrace 2>&1 | tail -200
+            RC=${PIPESTATUS[0]}
           else
-            ./gradlew assembleDebug --no-daemon
+            gradle "$TASK" --no-daemon --stacktrace 2>&1 | tail -200
+            RC=${PIPESTATUS[0]}
           fi
+          exit $RC
 
-      # ══════════════════════════════════════════════════════
-      #                        WEB2APK
-      # ══════════════════════════════════════════════════════
-      - name: WEB2APK — Create root gradle files
-        if: env.PTYPE == 'web2apk'
+      # ═══════════════ WEB2APK ═══════════════
+      - name: Web2APK — Scaffold
+        if: env.PT == 'web2apk'
+        shell: bash
         run: |
-          mkdir -p project
+          set +e
+          [ -z "$URL" ] && URL="https://example.com"
+          rm -rf project && mkdir -p project/app/src/main/java/com/web2apk/app
+          mkdir -p project/app/src/main/res/{layout,values,mipmap-hdpi,mipmap-mdpi,mipmap-xhdpi,mipmap-xxhdpi,mipmap-xxxhdpi}
+
           cat > project/build.gradle <<'EOF'
-          buildscript {
-              repositories { google(); mavenCentral() }
-              dependencies { classpath 'com.android.tools.build:gradle:8.7.3' }
-          }
+          buildscript { repositories { google(); mavenCentral() }
+            dependencies { classpath 'com.android.tools.build:gradle:8.7.3' } }
           allprojects { repositories { google(); mavenCentral() } }
           task clean(type: Delete) { delete rootProject.buildDir }
           EOF
           cat > project/settings.gradle <<'EOF'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
-          rootProject.name = "MyApp"
+          rootProject.name = "Web2APK"
           include ':app'
           EOF
-          cat > project/gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx2048m
-          android.useAndroidX=true
-          android.enableJetifier=true
-          EOF
+          echo "org.gradle.jvmargs=-Xmx2048m" > project/gradle.properties
+          echo "android.useAndroidX=true" >> project/gradle.properties
 
-      - name: WEB2APK — Create app/build.gradle
-        if: env.PTYPE == 'web2apk'
-        run: |
-          mkdir -p project/app
-          cat > project/app/build.gradle <<'EOF'
+          cat > project/app/build.gradle <<EOF
           plugins { id 'com.android.application' }
           android {
-              namespace 'com.web2apk.app'
+              namespace '${PKG}'
               compileSdk 34
               defaultConfig {
-                  applicationId "com.web2apk.app"
+                  applicationId "${PKG}"
                   minSdk 21
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode ${VC}
+                  versionName "${VN}"
               }
-              signingConfigs {
-                  release {
-                      storeFile file("debug.keystore")
-                      storePassword "android"
-                      keyAlias "androiddebugkey"
-                      keyPassword "android"
-                  }
-              }
-              buildTypes {
-                  release {
-                      signingConfig signingConfigs.release
-                      minifyEnabled false
-                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-                  }
-              }
+              buildTypes { release { minifyEnabled false } }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
                   targetCompatibility JavaVersion.VERSION_17
               }
           }
           dependencies {
-              implementation 'androidx.core:core-ktx:1.9.0'
               implementation 'androidx.appcompat:appcompat:1.6.1'
-              implementation 'com.google.android.material:material:1.8.0'
               implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
-              implementation 'androidx.webkit:webkit:1.4.0'
           }
           EOF
 
-      - name: WEB2APK — Create Java sources
-        if: env.PTYPE == 'web2apk'
-        run: |
-          mkdir -p project/app/src/main/java/com/web2apk/app
-          cat > project/app/src/main/java/com/web2apk/app/MainActivity.java <<'EOF'
-          package com.web2apk.app;
+          cat > project/app/src/main/java/com/web2apk/app/MainActivity.java <<EOF
+          package ${PKG};
           import android.annotation.SuppressLint;
           import android.app.DownloadManager;
           import android.content.Intent;
@@ -309,57 +430,35 @@ jobs:
           import android.os.Bundle;
           import android.os.Environment;
           import android.view.View;
-          import android.webkit.CookieManager;
-          import android.webkit.DownloadListener;
-          import android.webkit.WebChromeClient;
-          import android.webkit.WebResourceRequest;
-          import android.webkit.WebSettings;
-          import android.webkit.WebView;
-          import android.webkit.WebViewClient;
+          import android.webkit.*;
           import android.widget.ProgressBar;
           import androidx.appcompat.app.AppCompatActivity;
-          import androidx.appcompat.widget.Toolbar;
           import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
           public class MainActivity extends AppCompatActivity {
-              private static final String WEBSITE_URL = "URL_PLACEHOLDER";
               private WebView webView;
               private ProgressBar progressBar;
-              private SwipeRefreshLayout swipeRefreshLayout;
+              private SwipeRefreshLayout swipe;
               @SuppressLint("SetJavaScriptEnabled")
-              @Override protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
                   setContentView(R.layout.activity_main);
                   webView = findViewById(R.id.webView);
                   progressBar = findViewById(R.id.progressBar);
-                  swipeRefreshLayout = findViewById(R.id.swipeRefreshLayout);
-                  Toolbar toolbar = findViewById(R.id.toolbar);
-                  setSupportActionBar(toolbar);
-                  if (getSupportActionBar() != null) getSupportActionBar().setTitle(getString(R.string.app_name));
-                  setupWebView();
-                  swipeRefreshLayout.setOnRefreshListener(() -> webView.reload());
-                  webView.loadUrl(WEBSITE_URL);
-              }
-              @SuppressLint("SetJavaScriptEnabled")
-              private void setupWebView() {
+                  swipe = findViewById(R.id.swipeRefreshLayout);
                   WebSettings s = webView.getSettings();
                   s.setJavaScriptEnabled(true);
                   s.setDomStorageEnabled(true);
                   s.setDatabaseEnabled(true);
                   s.setMediaPlaybackRequiresUserGesture(false);
                   s.setAllowFileAccess(true);
-                  s.setAllowContentAccess(true);
-                  s.setUseWideViewPort(true);
-                  s.setLoadWithOverviewMode(true);
                   s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-                  CookieManager cm = CookieManager.getInstance();
-                  cm.setAcceptCookie(true);
-                  cm.setAcceptThirdPartyCookies(webView, true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
                   webView.setWebViewClient(new WebViewClient() {
-                      @Override public void onPageFinished(WebView v, String u) { progressBar.setVisibility(View.GONE); swipeRefreshLayout.setRefreshing(false); }
+                      @Override public void onPageFinished(WebView v, String u) { progressBar.setVisibility(View.GONE); swipe.setRefreshing(false); }
                       @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
-                          String url = r.getUrl().toString();
-                          if (url.startsWith("tel:")||url.startsWith("mailto:")||url.startsWith("intent:")||url.startsWith("whatsapp:")) {
-                              try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); } catch (Exception ignored) {}
+                          String u = r.getUrl().toString();
+                          if (u.startsWith("tel:")||u.startsWith("mailto:")||u.startsWith("whatsapp:")||u.startsWith("intent:")) {
+                              try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u))); } catch (Exception e) {}
                               return true;
                           }
                           return false;
@@ -377,72 +476,40 @@ jobs:
                       r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, cd);
                       ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
                   });
-                  webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+                  swipe.setOnRefreshListener(() -> webView.reload());
+                  webView.loadUrl("${URL}");
               }
-              @Override public void onBackPressed() { if (webView != null && webView.canGoBack()) { webView.goBack(); return; } super.onBackPressed(); }
-              @Override protected void onResume() { if (webView != null) webView.onResume(); }
-              @Override protected void onPause() { if (webView != null) webView.onPause(); super.onPause(); }
-              @Override protected void onDestroy() { if (webView != null) webView.destroy(); super.onDestroy(); }
-          }
-          EOF
-          cat > project/app/src/main/java/com/web2apk/app/SplashActivity.java <<'EOF'
-          package com.web2apk.app;
-          import android.content.Intent;
-          import android.os.Bundle;
-          import android.os.Handler;
-          import androidx.appcompat.app.AppCompatActivity;
-          public class SplashActivity extends AppCompatActivity {
-              private static final int SPLASH_DELAY = 1800;
-              @Override protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
-                  setContentView(R.layout.activity_splash);
-                  new Handler().postDelayed(() -> {
-                      startActivity(new Intent(SplashActivity.this, MainActivity.class));
-                      finish();
-                  }, SPLASH_DELAY);
+              @Override public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) { webView.goBack(); return; }
+                  super.onBackPressed();
               }
           }
           EOF
 
-      - name: WEB2APK — Create manifest & resources
-        if: env.PTYPE == 'web2apk'
-        run: |
-          mkdir -p project/app/src/main/res/layout
-          mkdir -p project/app/src/main/res/values
-          cat > project/app/src/main/AndroidManifest.xml <<'EOF'
+          cat > project/app/src/main/AndroidManifest.xml <<EOF
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.INTERNET" />
-              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-              <application
-                  android:allowBackup="true"
-                  android:hardwareAccelerated="true"
-                  android:usesCleartextTraffic="true"
-                  android:icon="@mipmap/ic_launcher"
-                  android:roundIcon="@mipmap/ic_launcher_round"
-                  android:label="@string/app_name"
-                  android:theme="@style/AppTheme">
-                  <activity android:name=".SplashActivity" android:exported="true" android:theme="@style/SplashTheme">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <application android:allowBackup="true" android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="true" android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name" android:theme="@style/AppTheme">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
                       <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
-                  <activity android:name=".MainActivity" android:exported="false"
-                      android:launchMode="singleTop"
-                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
               </application>
           </manifest>
           EOF
+
           cat > project/app/src/main/res/layout/activity_main.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              xmlns:app="http://schemas.android.com/apk/res-auto"
               android:layout_width="match_parent" android:layout_height="match_parent"
               android:orientation="vertical">
-              <androidx.appcompat.widget.Toolbar android:id="@+id/toolbar"
-                  android:layout_width="match_parent" android:layout_height="56dp"
-                  android:background="#000000" app:titleTextColor="#FFFFFF"/>
               <ProgressBar android:id="@+id/progressBar"
                   style="?android:attr/progressBarStyleHorizontal"
                   android:layout_width="match_parent" android:layout_height="4dp" android:max="100"/>
@@ -454,254 +521,98 @@ jobs:
               </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
           </LinearLayout>
           EOF
-          cat > project/app/src/main/res/layout/activity_splash.xml <<'EOF'
+
+          cat > project/app/src/main/res/values/strings.xml <<EOF
           <?xml version="1.0" encoding="utf-8"?>
-          <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent" android:layout_height="match_parent"
-              android:background="#000000">
-              <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
-                  android:layout_centerInParent="true" android:gravity="center" android:orientation="vertical">
-                  <ImageView android:id="@+id/splashLogo"
-                      android:layout_width="120dp" android:layout_height="120dp"
-                      android:src="@mipmap/ic_launcher" />
-                  <TextView android:id="@+id/splashAppName"
-                      android:layout_width="wrap_content" android:layout_height="wrap_content"
-                      android:text="@string/app_name" android:textSize="26sp"
-                      android:textStyle="bold" android:textColor="#FFFFFF" android:layout_marginTop="20dp" />
-                  <ProgressBar android:id="@+id/splashProgress"
-                      android:layout_width="40dp" android:layout_height="40dp" android:layout_marginTop="30dp" />
-              </LinearLayout>
-          </RelativeLayout>
-          EOF
-          cat > project/app/src/main/res/values/colors.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <color name="colorPrimary">#000000</color>
-              <color name="colorPrimaryDark">#000000</color>
-              <color name="colorAccent">#2196F3</color>
-              <color name="white">#FFFFFF</color>
-              <color name="black">#000000</color>
-          </resources>
-          EOF
-          cat > project/app/src/main/res/values/strings.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <string name="app_name">AppName</string>
-              <string name="loading">Loading...</string>
-          </resources>
+          <resources><string name="app_name">${APP}</string></resources>
           EOF
           cat > project/app/src/main/res/values/styles.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar">
+              <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
                   <item name="android:statusBarColor">#000000</item>
-                  <item name="android:navigationBarColor">#000000</item>
-                  <item name="android:windowLightStatusBar">false</item>
-              </style>
-              <style name="SplashTheme" parent="Theme.Material3.DayNight.NoActionBar">
-                  <item name="android:windowBackground">@android:color/black</item>
-                  <item name="android:statusBarColor">@android:color/transparent</item>
               </style>
           </resources>
           EOF
 
-      - name: WEB2APK — Apply config, icons, keystore
-        if: env.PTYPE == 'web2apk'
-        run: |
-          sed -i "s|URL_PLACEHOLDER|${WEB_URL}|g" project/app/src/main/java/com/web2apk/app/MainActivity.java
-          sed -i "s|<string name=\"app_name\">.*</string>|<string name=\"app_name\">${APP_NAME}</string>|g" project/app/src/main/res/values/strings.xml
-          sed -i "s|applicationId \"com.web2apk.app\"|applicationId \"${PKG}\"|" project/app/build.gradle
-          sed -i "s|namespace 'com.web2apk.app'|namespace '${PKG}'|" project/app/build.gradle
-          sed -i "s|versionCode 1|versionCode ${VCODE}|" project/app/build.gradle
-          sed -i "s|versionName \"1.0\"|versionName \"${VNAME}\"|" project/app/build.gradle
-
+          # Icons
           if [ ! -f build-assets/icon.png ]; then
-            echo "⚠️ Icon tidak ada, buat default..."
             mkdir -p build-assets
-            convert -size 512x512 xc:blue build-assets/icon.png
+            convert -size 512x512 xc:black -fill white -gravity center -pointsize 200 -annotate 0 "A" build-assets/icon.png 2>/dev/null || convert -size 512x512 xc:blue build-assets/icon.png
           fi
           for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
             D=${d%%:*}; S=${d##*:}
-            mkdir -p "project/app/src/main/res/mipmap-$D"
-            convert build-assets/icon.png -resize ${S}x${S} "project/app/src/main/res/mipmap-$D/ic_launcher.png"
-            cp "project/app/src/main/res/mipmap-$D/ic_launcher.png" "project/app/src/main/res/mipmap-$D/ic_launcher_round.png"
+            convert build-assets/icon.png -resize ${S}x${S} "project/app/src/main/res/mipmap-$D/ic_launcher.png" 2>/dev/null || true
           done
-          rm -f project/app/debug.keystore
-          keytool -genkey -v -keystore project/app/debug.keystore -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android -keypass android \
-            -dname "CN=Android Debug, O=Android, C=US"
 
-      - name: WEB2APK — Build
-        if: env.PTYPE == 'web2apk'
+      - name: Web2APK — Build
+        if: env.PT == 'web2apk'
+        shell: bash
         run: |
+          set +e
           cd project
-          gradle wrapper --gradle-version 8.9 || true
-          if [ -x ./gradlew ]; then ./gradlew assembleRelease --no-daemon
-          else gradle assembleRelease --no-daemon; fi
-
-      # ══════════════════════════════════════════════════════
-      #                         FLUTTER
-      # ══════════════════════════════════════════════════════
-      - name: FLUTTER — Prepare project
-        if: env.PTYPE == 'flutter'
-        run: |
-          rm -rf flutter-project
-          if [ -f flutter-project.zip ]; then
-            mkdir -p flutter-project
-            unzip -q flutter-project.zip -d flutter-project
-            FIRST_DIR=$(find flutter-project -mindepth 1 -maxdepth 1 -type d | head -n 1)
-            ROOT_FILES=$(find flutter-project -mindepth 1 -maxdepth 1 | wc -l)
-            if [ "$ROOT_FILES" = "1" ] && [ -n "$FIRST_DIR" ] && [ -f "$FIRST_DIR/pubspec.yaml" ]; then
-              TMP=$(mktemp -d); cp -R "$FIRST_DIR"/. "$TMP"/; rm -rf flutter-project
-              mkdir -p flutter-project; cp -R "$TMP"/. flutter-project/
-            fi
+          if [ -x ./gradlew ]; then
+            ./gradlew assembleRelease --no-daemon 2>&1 | tail -100
+            exit ${PIPESTATUS[0]}
           else
-            mkdir -p flutter-project
-            cp -R . flutter-project/ 2>/dev/null || true
+            gradle wrapper --gradle-version 8.9 >/dev/null 2>&1
+            if [ -x ./gradlew ]; then ./gradlew assembleRelease --no-daemon 2>&1 | tail -100
+            else gradle assembleRelease --no-daemon 2>&1 | tail -100; fi
+            exit ${PIPESTATUS[0]}
           fi
-          [ -f flutter-project/pubspec.yaml ] || { echo "❌ pubspec.yaml tidak ditemukan"; exit 1; }
 
-      - name: FLUTTER — Detect version
-        if: env.PTYPE == 'flutter'
-        id: flutter_detect
-        shell: bash
-        run: |
-          set -e
-          PUB="flutter-project/pubspec.yaml"
-          SDK_LINE=$(grep -A2 '^environment:' "$PUB" | grep 'sdk:' | head -n1 | sed 's/.*sdk:[[:space:]]*//; s/["'\'']//g' || true)
-          echo "Detected SDK: $SDK_LINE"
-          FLUTTER_VERSION="3.27.0"
-          DART_VERSION=$(echo "$SDK_LINE" | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-          if [ -n "$DART_VERSION" ]; then
-            case "$DART_VERSION" in
-              3.1[0-9]*) FLUTTER_VERSION="3.35.2" ;;
-              3.[89]*)   FLUTTER_VERSION="3.35.2" ;;
-              3.7*)      FLUTTER_VERSION="3.29.0" ;;
-              3.6*)      FLUTTER_VERSION="3.27.0" ;;
-              3.5*)      FLUTTER_VERSION="3.24.0" ;;
-              3.4*)      FLUTTER_VERSION="3.22.0" ;;
-              3.3*)      FLUTTER_VERSION="3.19.0" ;;
-              3.2*)      FLUTTER_VERSION="3.16.0" ;;
-              3.1*)      FLUTTER_VERSION="3.13.0" ;;
-              3.0*)      FLUTTER_VERSION="3.10.0" ;;
-            esac
-          fi
-          # Plugin override
-          grep -Eq 'webview_flutter:[[:space:]]*(\^|>=)?[45]\.' "$PUB" && FLUTTER_VERSION="3.35.2" || true
-          grep -Eq 'geolocator:[[:space:]]*(\^|>=)?1[4-9]\.' "$PUB" && FLUTTER_VERSION="3.35.2" || true
-          grep -Eq 'firebase_core:[[:space:]]*(\^|>=)?3\.' "$PUB" && FLUTTER_VERSION="3.35.2" || true
-          grep -Eq 'permission_handler:[[:space:]]*(\^|>=)?12\.' "$PUB" && FLUTTER_VERSION="3.35.2" || true
-          echo "FLUTTER_VERSION=$FLUTTER_VERSION" >> $GITHUB_ENV
-          echo "Using Flutter $FLUTTER_VERSION"
-
-      - name: FLUTTER — Setup SDK
-        if: env.PTYPE == 'flutter'
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
-
-      - name: FLUTTER — Build with auto-fix
-        if: env.PTYPE == 'flutter'
-        shell: bash
-        run: |
-          set -e
-          cd flutter-project
-          flutter --version
-          PUB_LOG="../pubget.log"
-          MAX=5; N=0; OK=false
-          try_get() { flutter pub get 2>&1 | tee "$PUB_LOG"; return ${PIPESTATUS[0]}; }
-          fix() {
-            F=false
-            if grep -q "requires SDK version" "$PUB_LOG" 2>/dev/null; then
-              sed -i -E "s/sdk:[[:space:]]*['\"]?[\^>=]*3\.[0-9]+(\.[0-9]+)?['\"]?/sdk: \">=3.6.0 <4.0.0\"/g" pubspec.yaml || true
-              F=true
-            fi
-            grep -q "webview_flutter" "$PUB_LOG" 2>/dev/null && sed -i -E "s/webview_flutter:[[:space:]]*['\"]?[^'\"]+['\"]?/webview_flutter: ^4.13.0/g" pubspec.yaml || true
-            grep -q "geolocator" "$PUB_LOG" 2>/dev/null && sed -i -E "s/geolocator:[[:space:]]*['\"]?[^'\"]+['\"]?/geolocator: ^13.0.4/g" pubspec.yaml || true
-            grep -q "firebase_core" "$PUB_LOG" 2>/dev/null && sed -i -E "s/firebase_core:[[:space:]]*['\"]?[^'\"]+['\"]?/firebase_core: ^2.32.0/g" pubspec.yaml || true
-            grep -q "permission_handler" "$PUB_LOG" 2>/dev/null && sed -i -E "s/permission_handler:[[:space:]]*['\"]?[^'\"]+['\"]?/permission_handler: ^11.3.1/g" pubspec.yaml || true
-            grep -q "image_picker" "$PUB_LOG" 2>/dev/null && sed -i -E "s/image_picker:[[:space:]]*['\"]?[^'\"]+['\"]?/image_picker: ^1.1.2/g" pubspec.yaml || true
-            grep -q "file_picker" "$PUB_LOG" 2>/dev/null && sed -i -E "s/file_picker:[[:space:]]*['\"]?[^'\"]+['\"]?/file_picker: ^6.2.1/g" pubspec.yaml || true
-            grep -q "google_maps_flutter" "$PUB_LOG" 2>/dev/null && sed -i -E "s/google_maps_flutter:[[:space:]]*['\"]?[^'\"]+['\"]?/google_maps_flutter: ^2.9.0/g" pubspec.yaml || true
-            [ "$F" = true ] && rm -f pubspec.lock
-          }
-          while [ $N -lt $MAX ] && [ "$OK" = false ]; do
-            N=$((N+1)); echo "=== Attempt $N/$MAX ==="
-            if try_get; then
-              if [ "$BTYPE" = "release" ]; then CMD="flutter build apk --release"
-              else CMD="flutter build apk --debug"; fi
-              if $CMD; then OK=true; break
-              else echo "❌ build fail, fix..."; fix; rm -rf build .dart_tool; fi
-            else
-              echo "❌ pub get fail, fix..."; fix; rm -f pubspec.lock
-            fi
-          done
-          [ "$OK" = true ] || { echo "Build gagal setelah $MAX percobaan"; cat "$PUB_LOG" || true; exit 1; }
-
-      # ══════════════════════════════════════════════════════
-      #                  COLLECT + SIGN + UPLOAD
-      # ══════════════════════════════════════════════════════
+      # ═══════════════ COLLECT + SIGN + UPLOAD ═══════════════
       - name: Collect APK
+        shell: bash
         run: |
+          set +e
           mkdir -p output
-          FOUND=""
-          case "$PTYPE" in
-            native)
-              if [ "$BTYPE" = "release" ]; then SRC="android/app/build/outputs/apk/release"
-              else SRC="android/app/build/outputs/apk/debug"; fi ;;
-            web2apk)
-              SRC="project/app/build/outputs/apk/release" ;;
-            flutter)
-              SRC="flutter-project/build/app/outputs/flutter-apk" ;;
-          esac
-          echo "Mencari APK di: $SRC"
-          APK=$(find "$SRC" -name "*.apk" 2>/dev/null | head -1)
-          if [ -z "$APK" ]; then
-            APK=$(find . -name "*.apk" -not -path "*/build/intermediates/*" 2>/dev/null | head -1)
-          fi
-          if [ -z "$APK" ]; then echo "❌ APK tidak ditemukan"; exit 1; fi
-          cp "$APK" "output/${APP_NAME}_v${VNAME}_${BTYPE}.apk"
-          echo "APK_FILE=output/${APP_NAME}_v${VNAME}_${BTYPE}.apk" >> $GITHUB_ENV
+          APK=$(find . -name "*.apk" -not -path "*/intermediates/*" -not -path "*/outputs/apk/*/tmp/*" 2>/dev/null | grep -vE "unaligned|debug-unaligned" | head -1)
+          [ -z "$APK" ] && APK=$(find . -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then echo "❌ APK tidak ditemukan"; find . -name "*.apk" 2>/dev/null; exit 1; fi
+          cp "$APK" "output/${APP}_v${VN}_${BT}.apk"
+          echo "APK_FILE=output/${APP}_v${VN}_${BT}.apk" >> $GITHUB_ENV
           ls -la output/
 
-      - name: Sign APK (release)
-        if: env.BTYPE == 'release'
+      - name: Sign APK
+        if: env.BT == 'release'
+        shell: bash
         run: |
+          set +e
           APK="${APK_FILE}"
-          BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
-          ZA="$ANDROID_HOME/build-tools/$BT/zipalign"
-          AS="$ANDROID_HOME/build-tools/$BT/apksigner"
+          BT_DIR=$(ls $SDK/build-tools 2>/dev/null | sort -V | tail -1)
+          ZA="$SDK/build-tools/$BT_DIR/zipalign"
+          AS="$SDK/build-tools/$BT_DIR/apksigner"
           if [ -x "$ZA" ] && [ -x "$AS" ]; then
-            "$ZA" -f -p 4 "$APK" "${APK}.aligned"
-            mv "${APK}.aligned" "$APK"
-            "$AS" sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK" || true
-            "$AS" verify "$APK" || true
+            "$ZA" -f -p 4 "$APK" "${APK}.aligned" && mv "${APK}.aligned" "$APK"
+            "$AS" sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK" 2>&1 | tail -3
+            "$AS" verify "$APK" 2>&1 | tail -3
           fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-v${{ env.VNAME }}-${{ env.BTYPE }}
+          name: ${{ env.APP }}-v${{ env.VN }}-${{ env.BT }}
           path: output/*.apk
           retention-days: 30
 
-      - name: Send APK to Telegram
-        if: env.CHAT_ID != '' && env.BOT_TOKEN != ''
+      - name: Send to Telegram
+        if: env.CHAT != '' && env.TOKEN != '' && success()
+        shell: bash
         run: |
+          set +e
           APK="${APK_FILE}"
           SIZE=$(du -sh "$APK" | cut -f1)
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-            -F chat_id="${CHAT_ID}" \
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \
+            -F chat_id="${CHAT}" \
             -F document=@"$APK" \
             -F parse_mode="HTML" \
-            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${APP_NAME}%0A📦 <b>Package:</b> <code>${PKG}</code>%0A🔢 <b>Versi:</b> <code>${VNAME}</code> (code: ${VCODE})%0A🔨 <b>Tipe:</b> <code>${BTYPE}</code>%0A📂 <b>Jenis:</b> <code>${PTYPE}</code>%0A📁 <b>Size:</b> <code>${SIZE}</code>"
+            -F caption="✅ <b>Build Success</b>%0A🏷️ ${APP}%0A📦 <code>${PKG}</code>%0A🔢 ${VN} (${VC})%0A🔨 ${BT} • ${PT}%0A📁 ${SIZE}"
 
       - name: Notify Failure
-        if: failure() && env.CHAT_ID != '' && env.BOT_TOKEN != ''
+        if: failure() && env.CHAT != '' && env.TOKEN != ''
+        shell: bash
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" -d parse_mode="HTML" \
-            -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${APP_NAME}</code>%0A📦 Package: <code>${PKG}</code>%0A📂 Jenis: <code>${PTYPE}</code>%0A%0A🔗 https://github.com/${{ github.repository }}/actions"
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d chat_id="${CHAT}" -d parse_mode="HTML" \
+            -d text="❌ <b>Build Gagal</b>%0A🏷️ ${APP}%0A📂 ${PT}%0A🔗 https://github.com/${{ github.repository }}/actions"
