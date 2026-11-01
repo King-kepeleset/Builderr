@@ -298,20 +298,48 @@ jobs:
         if: env.PT == 'native'
         shell: bash
         run: |
-          set -euo pipefail
-          NATIVE_ROOT="."
-          if [ -f android/gradlew ]; then
-            NATIVE_ROOT="android"
-          elif [ -f gradlew ]; then
-            NATIVE_ROOT="."
-          else
-            FOUND=$(find . -maxdepth 5 -type f -name gradlew -not -path '*/.gradle/*' | head -1 || true)
-            if [ -n "$FOUND" ]; then NATIVE_ROOT=$(dirname "$FOUND");
-            elif [ -d android ]; then NATIVE_ROOT="android";
-            else echo "Gradle Android project/wrapper not found"; exit 1; fi
+          set -Eeuo pipefail
+          echo "Scanning for Android Gradle project..."
+          NATIVE_ROOT=""
+
+          # Prefer conventional Android module, then repository root.
+          for candidate in android .; do
+            if [ -f "$candidate/settings.gradle" ] || [ -f "$candidate/settings.gradle.kts" ]; then
+              if [ -d "$candidate/app" ]; then NATIVE_ROOT="$candidate"; break; fi
+            fi
+          done
+
+          # Search nested projects without a pipe-to-head SIGPIPE failure.
+          if [ -z "$NATIVE_ROOT" ]; then
+            while IFS= read -r settings_file; do
+              candidate="$(dirname "$settings_file")"
+              if [ -d "$candidate/app" ]; then NATIVE_ROOT="$candidate"; break; fi
+            done < <(find . -maxdepth 7 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/.gradle/*' -print)
           fi
+
+          # Some older Android projects omit settings.gradle; accept a root with app module.
+          if [ -z "$NATIVE_ROOT" ]; then
+            for candidate in android .; do
+              if [ -d "$candidate/app" ] && { [ -f "$candidate/build.gradle" ] || [ -f "$candidate/build.gradle.kts" ]; }; then
+                NATIVE_ROOT="$candidate"; break
+              fi
+            done
+          fi
+
+          if [ -z "$NATIVE_ROOT" ]; then
+            echo "ERROR: Android Gradle project root not found."
+            echo "Expected settings.gradle(.kts) and app/build.gradle(.kts), or a root build.gradle with app/ module."
+            echo "Repository files (depth 4):"
+            find . -maxdepth 4 -type f \( -name 'settings.gradle*' -o -name 'build.gradle*' -o -name 'gradlew' \) -print | sort || true
+            exit 1
+          fi
+
+          NATIVE_ROOT="${NATIVE_ROOT#./}"
+          [ -n "$NATIVE_ROOT" ] || NATIVE_ROOT="."
           echo "NATIVE_ROOT=$NATIVE_ROOT" >> "$GITHUB_ENV"
           echo "Native Gradle root: $NATIVE_ROOT"
+          echo "Gradle files:"
+          find "$NATIVE_ROOT" -maxdepth 3 -type f \( -name 'settings.gradle*' -o -name 'build.gradle*' -o -name 'gradlew' \) -print | sort
 
       - name: Native — Patch Config
         if: env.PT == 'native'
@@ -351,13 +379,26 @@ jobs:
         if: env.PT == 'native'
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           cd "${NATIVE_ROOT:-.}"
+          if [ ! -d app ]; then
+            echo "ERROR: app/ module is missing in $PWD"
+            exit 1
+          fi
+          if [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+            echo "No settings.gradle found; creating a minimal settings file for :app."
+            printf "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositories { google(); mavenCentral() } }\nrootProject.name = \"AndroidProject\"\ninclude(\":app\")\n" > settings.gradle
+          fi
           if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.9
+            echo "Gradle wrapper missing; generating wrapper with installed Gradle."
+            gradle wrapper --gradle-version 8.9 --distribution-type bin
           fi
           chmod +x gradlew
-          test -f gradle/wrapper/gradle-wrapper.jar || { echo "Gradle wrapper JAR missing"; exit 1; }
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "ERROR: gradle/wrapper/gradle-wrapper.jar is missing after wrapper generation."
+            exit 1
+          fi
+          test -f app/build.gradle -o -f app/build.gradle.kts || { echo "ERROR: app/build.gradle(.kts) missing"; exit 1; }
 
       - name: Native — Build
         if: env.PT == 'native'
