@@ -25,8 +25,18 @@ on:
       website_url:
         required: false
         default: ''
+      chat_id:
+        required: false
+        default: ''
+      bot_token:
+        required: false
+        default: ''
   push:
     branches: [build]
+
+concurrency:
+  group: cwooloxd-android-builder-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -44,68 +54,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Android SDK Environment
+      # ═══════════════ ENV SETUP ═══════════════
+      - name: Android SDK Env
         run: |
-          set +e
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
           echo "SDK=$SDK" >> $GITHUB_ENV
-
-          SDKMGR=$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)
+          find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1 > /tmp/sdkmgr
+          SDKMGR=$(cat /tmp/sdkmgr 2>/dev/null || true)
           if [ -n "$SDKMGR" ]; then
-            echo "Found sdkmanager: $SDKMGR"
             yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
           fi
+          echo "SDKMGR=$SDKMGR" >> $GITHUB_ENV
 
-          echo "Build tools available:"
-          ls "$SDK/build-tools" 2>/dev/null || true
-          echo "Platforms available:"
-          ls "$SDK/platforms" 2>/dev/null || true
+      - name: Android SDK
+        uses: android-actions/setup-android@v4
 
-      - name: Setup JDK 17
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Python
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Tools
+      - name: Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq imagemagick jq unzip curl zip >/dev/null
 
-      - name: Generate Keystore
+      - name: Keystore
         run: |
           keytool -genkey -v -keystore release.keystore -alias release \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass password -keypass password \
             -dname "CN=Builder, O=Builder, C=ID" 2>/dev/null
 
+      # ═══════════════ RESOLVE CONFIG ═══════════════
       - name: Resolve Config
         id: cfg
         shell: bash
         run: |
           set +e
-          PT="${{ github.event.inputs.project_type }}"
-          [ -z "$PT" ] && PT="auto"
+          PT="${{ github.event.inputs.project_type }}"; [ -z "$PT" ] && PT="auto"
           APP="${{ github.event.inputs.app_name }}"
           PKG="${{ github.event.inputs.package_name }}"
           VN="${{ github.event.inputs.version_name }}"
           VC="${{ github.event.inputs.version_code }}"
           BT="${{ github.event.inputs.build_type }}"
-          [ -z "$BT" ] && BT="release"
           URL="${{ github.event.inputs.website_url }}"
+          CHAT="${{ github.event.inputs.chat_id }}"
+          TOKEN="${{ github.event.inputs.bot_token }}"
+          [ -z "$BT" ] && BT="release"
 
           for f in build-config.json config.json builder.json app.json; do
             if [ -f "$f" ]; then
-              echo "::group::$f"
-              cat "$f"
-              echo "::endgroup::"
               [ -z "$APP" ] && APP=$(jq -r '.app_name // .name // empty' "$f" 2>/dev/null)
               [ -z "$PKG" ] && PKG=$(jq -r '.package_name // .package // .applicationId // empty' "$f" 2>/dev/null)
               [ -z "$VN" ]  && VN=$(jq -r '.version_name // .version // empty' "$f" 2>/dev/null)
@@ -113,8 +125,7 @@ jobs:
               [ -z "$URL" ] && URL=$(jq -r '.url // .website // .web_url // empty' "$f" 2>/dev/null)
               [ -z "$BT" ]  && BT=$(jq -r '.build_type // empty' "$f" 2>/dev/null)
               if [ "$PT" = "auto" ]; then
-                T=$(jq -r '.type // empty' "$f" 2>/dev/null)
-                [ -n "$T" ] && PT="$T"
+                T=$(jq -r '.project_type // .type // empty' "$f" 2>/dev/null); [ -n "$T" ] && PT="$T"
               fi
             fi
           done
@@ -124,32 +135,38 @@ jobs:
           [ -z "$VN" ]  && VN="1.0.0"
           [ -z "$VC" ]  && VC="1"
           [ -z "$BT" ]  && BT="release"
+          case "$BT" in debug|release) ;; *) echo "Invalid build_type: $BT"; exit 1;; esac
+          case "$PT" in auto|flutter|native|web2apk) ;; *) echo "Invalid project_type: $PT"; exit 1;; esac
+          [[ "$PKG" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || { echo "Invalid package name: $PKG"; exit 1; }
+          [[ "$VC" =~ ^[0-9]+$ ]] || { echo "Invalid version code: $VC"; exit 1; }
 
+          # Auto-detect project type
           if [ "$PT" = "auto" ] || [ -z "$PT" ]; then
-            if [ -f pubspec.yaml ]; then
+            if [ -f pubspec.yaml ] || [ -f flutter-project.zip ] || ls *.zip 2>/dev/null | grep -qi flutter; then
               PT="flutter"
-            elif [ -f android/gradlew ] || [ -d android/app ]; then
+            elif [ -f package.json ] && (grep -q '"react-native"' package.json 2>/dev/null || grep -q '"@capacitor/core"' package.json 2>/dev/null); then
+              PT="native"
+            elif [ -f android/gradlew ] || [ -d android/app ] || [ -f build.gradle ] || [ -f settings.gradle ]; then
               PT="native"
             elif [ -n "$URL" ]; then
               PT="web2apk"
-            elif ls *.zip 2>/dev/null | head -1 | grep -q zip; then
-              ZIP=$(ls *.zip 2>/dev/null | head -1)
-              if unzip -l "$ZIP" 2>/dev/null | grep -q 'pubspec.yaml'; then PT="flutter"
-              elif unzip -l "$ZIP" 2>/dev/null | grep -q 'android/gradlew'; then PT="native"
-              else PT="web2apk"; fi
             else
-              PT="web2apk"
+              # Cek isi zip
+              ZIP=$(ls *.zip 2>/dev/null | head -1)
+              if [ -n "$ZIP" ]; then
+                if unzip -l "$ZIP" 2>/dev/null | grep -q 'pubspec.yaml'; then PT="flutter"
+                elif unzip -l "$ZIP" 2>/dev/null | grep -q 'android/gradlew'; then PT="native"
+                else PT="web2apk"; fi
+              else
+                PT="web2apk"
+              fi
             fi
           fi
 
           {
-            echo "PT=$PT"
-            echo "APP=$APP"
-            echo "PKG=$PKG"
-            echo "VN=$VN"
-            echo "VC=$VC"
-            echo "BT=$BT"
-            echo "URL=$URL"
+            echo "PT=$PT"; echo "APP=$APP"; echo "PKG=$PKG"
+            echo "VN=$VN"; echo "VC=$VC"; echo "BT=$BT"
+            echo "URL=$URL"; echo "CHAT=$CHAT"; echo "TOKEN=$TOKEN"
           } >> $GITHUB_ENV
 
           echo "═══════ CONFIG ═══════"
@@ -161,75 +178,59 @@ jobs:
           echo "URL     : $URL"
           echo "══════════════════════"
 
+      - name: Notify Start
+        if: env.CHAT != '' && env.TOKEN != ''
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d chat_id="${CHAT}" -d parse_mode="HTML" \
+            -d text="⏳ <b>Build Start</b>%0A🏷️ ${APP}%0A📦 <code>${PKG}</code>%0A🔨 ${BT} • ${PT}"
+
+      # ═══════════════ UNZIP (kalau ada ZIP) ═══════════════
       - name: Auto Unzip
-        if: env.PT != 'flutter'
         shell: bash
         run: |
           set +e
           ZIP=$(ls *.zip 2>/dev/null | head -1)
           if [ -n "$ZIP" ] && [ ! -d "src" ]; then
-            echo "Found ZIP: $ZIP"
+            echo "📦 Found ZIP: $ZIP"
             mkdir -p src
             unzip -q "$ZIP" -d src 2>/dev/null
+            # Ratakan kalau cuma 1 folder
             CNT=$(find src -mindepth 1 -maxdepth 1 | wc -l)
             FIRST=$(find src -mindepth 1 -maxdepth 1 -type d | head -1)
             if [ "$CNT" = "1" ] && [ -n "$FIRST" ] && [ -z "$(find src -mindepth 1 -maxdepth 1 -type f)" ]; then
-              TMP=$(mktemp -d)
-              cp -R "$FIRST"/. "$TMP"/
-              rm -rf src
-              mkdir -p src
-              cp -R "$TMP"/. src/
+              TMP=$(mktemp -d); cp -R "$FIRST"/. "$TMP"/; rm -rf src; mkdir -p src; cp -R "$TMP"/. src/
             fi
+            # Pindah ke root
             if [ -f src/pubspec.yaml ] || [ -f src/android/gradlew ] || [ -d src/android ]; then
               cp -R src/. . 2>/dev/null || true
             fi
           fi
+          echo "── Root listing ──"
+          ls -la
 
-      - name: Flutter - Prepare Project
+      # ═══════════════ FLUTTER ═══════════════
+      - name: Flutter — Setup Project
         if: env.PT == 'flutter'
         shell: bash
         run: |
           set +e
           if [ -f pubspec.yaml ]; then
             mkdir -p flutter-project
-            cp -R . flutter-project/ 2>/dev/null || true
-            rm -rf flutter-project/flutter-project flutter-project/src
+            rsync -a --exclude='flutter-project' --exclude='.git' --exclude='build' --exclude='.dart_tool' ./ flutter-project/
           elif [ -f flutter-project.zip ]; then
             mkdir -p flutter-project
             unzip -q flutter-project.zip -d flutter-project
             FIRST=$(find flutter-project -mindepth 1 -maxdepth 1 -type d | head -1)
             CNT=$(find flutter-project -mindepth 1 -maxdepth 1 | wc -l)
             if [ "$CNT" = "1" ] && [ -f "$FIRST/pubspec.yaml" ]; then
-              TMP=$(mktemp -d)
-              cp -R "$FIRST"/. "$TMP"/
-              rm -rf flutter-project
-              mkdir -p flutter-project
-              cp -R "$TMP"/. flutter-project/
-            fi
-          else
-            ZIP=$(ls *.zip 2>/dev/null | head -1)
-            if [ -n "$ZIP" ]; then
-              mkdir -p flutter-project
-              unzip -q "$ZIP" -d flutter-project
-              FIRST=$(find flutter-project -mindepth 1 -maxdepth 1 -type d | head -1)
-              CNT=$(find flutter-project -mindepth 1 -maxdepth 1 | wc -l)
-              if [ "$CNT" = "1" ] && [ -f "$FIRST/pubspec.yaml" ]; then
-                TMP=$(mktemp -d)
-                cp -R "$FIRST"/. "$TMP"/
-                rm -rf flutter-project
-                mkdir -p flutter-project
-                cp -R "$TMP"/. flutter-project/
-              fi
+              TMP=$(mktemp -d); cp -R "$FIRST"/. "$TMP"/; rm -rf flutter-project
+              mkdir -p flutter-project; cp -R "$TMP"/. flutter-project/
             fi
           fi
+          [ -f flutter-project/pubspec.yaml ] && echo "✓ pubspec.yaml OK" || { echo "❌ pubspec.yaml not found"; exit 1; }
 
-          if [ ! -f flutter-project/pubspec.yaml ]; then
-            echo "ERROR: pubspec.yaml not found"
-            exit 1
-          fi
-          echo "Flutter project ready"
-
-      - name: Flutter - Detect Version
+      - name: Flutter — Detect Version
         if: env.PT == 'flutter'
         shell: bash
         run: |
@@ -237,8 +238,6 @@ jobs:
           PUB="flutter-project/pubspec.yaml"
           SDK=$(grep -A3 '^environment:' "$PUB" | grep 'sdk:' | head -1 | sed 's/.*sdk:[[:space:]]*//; s/["'"'"']//g')
           DART=$(echo "$SDK" | grep -oE '[0-9]+\.[0-9]+' | head -1)
-          echo "Detected Dart SDK: $DART"
-
           FV="3.27.0"
           case "$DART" in
             3.1[0-9]*) FV="3.35.2" ;;
@@ -252,16 +251,13 @@ jobs:
             3.1*)      FV="3.13.0" ;;
             3.0*)      FV="3.10.0" ;;
           esac
-
           grep -qE 'webview_flutter:[[:space:]]*(\^|>=)?[45]\.' "$PUB" && FV="3.35.2"
           grep -qE 'geolocator:[[:space:]]*(\^|>=)?1[4-9]\.' "$PUB" && FV="3.35.2"
           grep -qE 'firebase_core:[[:space:]]*(\^|>=)?3\.' "$PUB" && FV="3.35.2"
-          grep -qE 'permission_handler:[[:space:]]*(\^|>=)?12\.' "$PUB" && FV="3.35.2"
-
           echo "FLUTTER_VERSION=$FV" >> $GITHUB_ENV
           echo "Using Flutter $FV"
 
-      - name: Flutter - Setup SDK
+      - name: Flutter — Setup SDK
         if: env.PT == 'flutter'
         uses: subosito/flutter-action@v2
         with:
@@ -269,63 +265,55 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Flutter - Build
+      - name: Flutter — Build
         if: env.PT == 'flutter'
         shell: bash
         run: |
           set +e
           cd flutter-project
           flutter config --no-analytics >/dev/null 2>&1
-          MAX=4
-          N=0
-          OK=0
+          MAX=4; N=0; OK=0
           while [ $N -lt $MAX ] && [ $OK -eq 0 ]; do
             N=$((N+1))
-            echo "Attempt $N/$MAX"
+            echo "── Attempt $N/$MAX ──"
             flutter pub get 2>&1 | tee ../pub.log
             if [ ${PIPESTATUS[0]} -eq 0 ]; then
-              if [ "$BT" = "release" ]; then
-                flutter build apk --release 2>&1 | tee -a ../pub.log
-              else
-                flutter build apk --debug 2>&1 | tee -a ../pub.log
-              fi
+              if [ "$BT" = "release" ]; then flutter build apk --release 2>&1 | tee -a ../pub.log
+              else flutter build apk --debug 2>&1 | tee -a ../pub.log; fi
               [ ${PIPESTATUS[0]} -eq 0 ] && OK=1 && break
             fi
+            # Auto-fix
             sed -i -E "s/sdk:[[:space:]]*['\"]?[\^>=]*3\.[0-9]+(\.[0-9]+)?['\"]?/sdk: \">=3.6.0 <4.0.0\"/g" pubspec.yaml 2>/dev/null
             grep -q "webview_flutter" ../pub.log 2>/dev/null && sed -i -E "s/webview_flutter:[[:space:]]*['\"]?[^'\"]+['\"]?/webview_flutter: ^4.13.0/g" pubspec.yaml
             grep -q "geolocator" ../pub.log 2>/dev/null && sed -i -E "s/geolocator:[[:space:]]*['\"]?[^'\"]+['\"]?/geolocator: ^13.0.4/g" pubspec.yaml
             grep -q "firebase_core" ../pub.log 2>/dev/null && sed -i -E "s/firebase_core:[[:space:]]*['\"]?[^'\"]+['\"]?/firebase_core: ^2.32.0/g" pubspec.yaml
             grep -q "permission_handler" ../pub.log 2>/dev/null && sed -i -E "s/permission_handler:[[:space:]]*['\"]?[^'\"]+['\"]?/permission_handler: ^11.3.1/g" pubspec.yaml
-            rm -f pubspec.lock
-            rm -rf build .dart_tool
+            grep -q "image_picker" ../pub.log 2>/dev/null && sed -i -E "s/image_picker:[[:space:]]*['\"]?[^'\"]+['\"]?/image_picker: ^1.1.2/g" pubspec.yaml
+            rm -f pubspec.lock; rm -rf build .dart_tool
           done
-          if [ $OK -eq 1 ]; then
-            echo "Flutter build OK"
-          else
-            echo "Flutter build FAILED"
-            tail -100 ../pub.log
-            exit 1
-          fi
+          [ $OK -eq 1 ] && echo "✅ Flutter build OK" || { echo "❌ Flutter gagal"; tail -100 ../pub.log; exit 1; }
 
-      - name: Native - Locate Project
+      # ═══════════════ NATIVE ═══════════════
+      - name: Native — Locate Project
         if: env.PT == 'native'
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           NATIVE_ROOT="."
-          if [ ! -f android/gradlew ] && [ ! -f android/build.gradle ] && [ ! -f android/build.gradle.kts ]; then
-            FOUND=$(find . -maxdepth 3 -name "gradlew" -type f 2>/dev/null | grep -v "gradle/wrapper" | head -1)
-            if [ -n "$FOUND" ]; then
-              NATIVE_ROOT=$(dirname "$FOUND")
-              echo "Found native root: $NATIVE_ROOT"
-            fi
+          if [ -f android/gradlew ]; then
+            NATIVE_ROOT="android"
+          elif [ -f gradlew ]; then
+            NATIVE_ROOT="."
+          else
+            FOUND=$(find . -maxdepth 5 -type f -name gradlew -not -path '*/.gradle/*' | head -1 || true)
+            if [ -n "$FOUND" ]; then NATIVE_ROOT=$(dirname "$FOUND");
+            elif [ -d android ]; then NATIVE_ROOT="android";
+            else echo "Gradle Android project/wrapper not found"; exit 1; fi
           fi
-          if [ -d "$NATIVE_ROOT/android" ] && [ ! -f "$NATIVE_ROOT/gradlew" ]; then
-            [ -f "$NATIVE_ROOT/android/gradlew" ] && NATIVE_ROOT="$NATIVE_ROOT/android"
-          fi
-          echo "NATIVE_ROOT=$NATIVE_ROOT" >> $GITHUB_ENV
+          echo "NATIVE_ROOT=$NATIVE_ROOT" >> "$GITHUB_ENV"
+          echo "Native Gradle root: $NATIVE_ROOT"
 
-      - name: Native - Patch Config
+      - name: Native — Patch Config
         if: env.PT == 'native'
         shell: bash
         run: |
@@ -352,74 +340,57 @@ jobs:
             [ -f "$S" ] && sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${APP}</string>|g" "$S"
           done
 
-      - name: Native - Fix Gradle Wrapper
+      - name: Native — Icons
         if: env.PT == 'native'
         shell: bash
         run: |
           set +e
-          cd "${NATIVE_ROOT:-.}"
-          if [ -f gradlew ]; then
-            chmod +x gradlew
-            if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
-              mkdir -p gradle/wrapper
-              curl -sL -o gradle/wrapper/gradle-wrapper.jar \
-                "https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar"
-            fi
-          fi
+          [ -f generate_icons.py ] && pip install Pillow -q && python3 generate_icons.py || echo "skip icons"
 
-      - name: Native - Build
+      - name: Native — Fix Gradle Wrapper
         if: env.PT == 'native'
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           cd "${NATIVE_ROOT:-.}"
-          chmod +x gradlew 2>/dev/null
-          if [ "$BT" = "release" ]; then
-            TASK="assembleRelease"
-          else
-            TASK="assembleDebug"
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.9
           fi
-          if [ -x ./gradlew ]; then
-            ./gradlew "$TASK" --no-daemon --stacktrace 2>&1 | tail -200
-            RC=${PIPESTATUS[0]}
-          else
-            gradle "$TASK" --no-daemon --stacktrace 2>&1 | tail -200
-            RC=${PIPESTATUS[0]}
-          fi
-          exit $RC
+          chmod +x gradlew
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "Gradle wrapper JAR missing"; exit 1; }
 
-      - name: Web2APK - Scaffold
+      - name: Native — Build
+        if: env.PT == 'native'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${NATIVE_ROOT:-.}"
+          chmod +x gradlew
+          if [ "$BT" = "release" ]; then TASK="assembleRelease"; else TASK="assembleDebug"; fi
+          ./gradlew "$TASK" --no-daemon --stacktrace
+
+      # ═══════════════ WEB2APK ═══════════════
+      - name: Web2APK — Scaffold
         if: env.PT == 'web2apk'
         shell: bash
         run: |
           set +e
           [ -z "$URL" ] && URL="https://example.com"
-          rm -rf project
-          mkdir -p project/app/src/main/java/com/web2apk/app
-          mkdir -p project/app/src/main/res/layout
-          mkdir -p project/app/src/main/res/values
-          mkdir -p project/app/src/main/res/mipmap-hdpi
-          mkdir -p project/app/src/main/res/mipmap-mdpi
-          mkdir -p project/app/src/main/res/mipmap-xhdpi
-          mkdir -p project/app/src/main/res/mipmap-xxhdpi
-          mkdir -p project/app/src/main/res/mipmap-xxxhdpi
+          rm -rf project && mkdir -p project/app/src/main/java/com/web2apk/app
+          mkdir -p project/app/src/main/res/{layout,values,mipmap-hdpi,mipmap-mdpi,mipmap-xhdpi,mipmap-xxhdpi,mipmap-xxxhdpi}
 
           cat > project/build.gradle <<'EOF'
-          buildscript {
-              repositories { google(); mavenCentral() }
-              dependencies { classpath 'com.android.tools.build:gradle:8.7.3' }
-          }
+          buildscript { repositories { google(); mavenCentral() }
+            dependencies { classpath 'com.android.tools.build:gradle:8.7.3' } }
           allprojects { repositories { google(); mavenCentral() } }
           task clean(type: Delete) { delete rootProject.buildDir }
           EOF
-
           cat > project/settings.gradle <<'EOF'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
           rootProject.name = "Web2APK"
           include ':app'
           EOF
-
           echo "org.gradle.jvmargs=-Xmx2048m" > project/gradle.properties
           echo "android.useAndroidX=true" >> project/gradle.properties
 
@@ -480,13 +451,10 @@ jobs:
                   s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
                   CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
                   webView.setWebViewClient(new WebViewClient() {
-                      @Override public void onPageFinished(WebView v, String u) {
-                          progressBar.setVisibility(View.GONE);
-                          swipe.setRefreshing(false);
-                      }
+                      @Override public void onPageFinished(WebView v, String u) { progressBar.setVisibility(View.GONE); swipe.setRefreshing(false); }
                       @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
                           String u = r.getUrl().toString();
-                          if (u.startsWith("tel:") || u.startsWith("mailto:") || u.startsWith("whatsapp:") || u.startsWith("intent:")) {
+                          if (u.startsWith("tel:")||u.startsWith("mailto:")||u.startsWith("whatsapp:")||u.startsWith("intent:")) {
                               try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u))); } catch (Exception e) {}
                               return true;
                           }
@@ -555,7 +523,6 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <resources><string name="app_name">${APP}</string></resources>
           EOF
-
           cat > project/app/src/main/res/values/styles.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
@@ -565,51 +532,43 @@ jobs:
           </resources>
           EOF
 
+          # Icons
           if [ ! -f build-assets/icon.png ]; then
             mkdir -p build-assets
             convert -size 512x512 xc:black -fill white -gravity center -pointsize 200 -annotate 0 "A" build-assets/icon.png 2>/dev/null || convert -size 512x512 xc:blue build-assets/icon.png
           fi
-
           for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-            D=${d%%:*}
-            S=${d##*:}
+            D=${d%%:*}; S=${d##*:}
             convert build-assets/icon.png -resize ${S}x${S} "project/app/src/main/res/mipmap-$D/ic_launcher.png" 2>/dev/null || true
           done
 
-      - name: Web2APK - Build
+      - name: Web2APK — Build
         if: env.PT == 'web2apk'
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           cd project
-          if [ -x ./gradlew ]; then
-            ./gradlew assembleRelease --no-daemon 2>&1 | tail -100
-            exit ${PIPESTATUS[0]}
-          else
-            gradle wrapper --gradle-version 8.9 >/dev/null 2>&1
-            if [ -x ./gradlew ]; then
-              ./gradlew assembleRelease --no-daemon 2>&1 | tail -100
-            else
-              gradle assembleRelease --no-daemon 2>&1 | tail -100
-            fi
-            exit ${PIPESTATUS[0]}
-          fi
+          if [ ! -f gradlew ]; then gradle wrapper --gradle-version 8.9; fi
+          chmod +x gradlew
+          if [ "$BT" = "debug" ]; then TASK="assembleDebug"; else TASK="assembleRelease"; fi
+          ./gradlew "$TASK" --no-daemon --stacktrace
 
+      # ═══════════════ COLLECT + SIGN + UPLOAD ═══════════════
       - name: Collect APK
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           mkdir -p output
-          APK=$(find . -name "*.apk" -not -path "*/intermediates/*" -not -path "*/outputs/apk/*/tmp/*" 2>/dev/null | grep -vE "unaligned|debug-unaligned" | head -1)
-          [ -z "$APK" ] && APK=$(find . -name "*.apk" 2>/dev/null | head -1)
+          APK=$(find . -type f -name "*-${BT}.apk" \
+            -not -path '*/intermediates/*' -not -path '*/tmp/*' | head -1 || true)
           if [ -z "$APK" ]; then
-            echo "ERROR: APK not found"
-            find . -name "*.apk" 2>/dev/null
+            echo "APK ${BT} tidak ditemukan. Kandidat yang tersedia:"
+            find . -type f -name '*.apk' -print || true
             exit 1
           fi
           cp "$APK" "output/${APP}_v${VN}_${BT}.apk"
-          echo "APK_FILE=output/${APP}_v${VN}_${BT}.apk" >> $GITHUB_ENV
-          ls -la output/
+          echo "APK_FILE=output/${APP}_v${VN}_${BT}.apk" >> "$GITHUB_ENV"
+          ls -lh output/
 
       - name: Sign APK
         if: env.BT == 'release'
@@ -624,9 +583,6 @@ jobs:
             "$ZA" -f -p 4 "$APK" "${APK}.aligned" && mv "${APK}.aligned" "$APK"
             "$AS" sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK" 2>&1 | tail -3
             "$AS" verify "$APK" 2>&1 | tail -3
-            echo "APK signed successfully"
-          else
-            echo "WARNING: zipalign/apksigner not found, skipping sign"
           fi
 
       - name: Upload Artifact
@@ -635,4 +591,24 @@ jobs:
           name: ${{ env.APP }}-v${{ env.VN }}-${{ env.BT }}
           path: output/*.apk
           retention-days: 30
-          if-no-files-found: error
+
+      - name: Send to Telegram
+        if: env.CHAT != '' && env.TOKEN != '' && success()
+        shell: bash
+        run: |
+          set +e
+          APK="${APK_FILE}"
+          SIZE=$(du -sh "$APK" | cut -f1)
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \
+            -F chat_id="${CHAT}" \
+            -F document=@"$APK" \
+            -F parse_mode="HTML" \
+            -F caption="✅ <b>Build Success</b>%0A🏷️ ${APP}%0A📦 <code>${PKG}</code>%0A🔢 ${VN} (${VC})%0A🔨 ${BT} • ${PT}%0A📁 ${SIZE}"
+
+      - name: Notify Failure
+        if: failure() && env.CHAT != '' && env.TOKEN != ''
+        shell: bash
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d chat_id="${CHAT}" -d parse_mode="HTML" \
+            -d text="❌ <b>Build Gagal</b>%0A🏷️ ${APP}%0A📂 ${PT}%0A🔗 https://github.com/${{ github.repository }}/actions"
